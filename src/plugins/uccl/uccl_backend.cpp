@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <chrono>
+#include <atomic>
 
 // Parse connection string in format: ip_addr:port?gpu_index
 bool
@@ -107,10 +108,7 @@ nixlUcclEngine::~nixlUcclEngine() {
         std::lock_guard<std::mutex> lock(mem_mutex_);
         for (auto &[addr, priv] : mem_reg_info_) {
             if (priv && priv->mr_id != 0) {
-                uccl_mr_t *mr = reinterpret_cast<uccl_mr_t *>(priv->mr_id);
-                if (mr) {
-                    uccl_engine_mr_destroy(mr);
-                }
+                uccl_engine_mr_destroy(engine_, priv->mr_id);
             }
             delete priv;
         }
@@ -281,8 +279,8 @@ nixlUcclEngine::registerMem(const nixlBlobDesc &mem,
     }
 
     // Register memory with UCCL engine
-    uccl_mr_t *mr = uccl_engine_reg(engine_, mem.addr, mem.len);
-    if (!mr) {
+    uccl_mr_t mr = uccl_engine_reg(engine_, mem.addr, mem.len);
+    if (mr == 0) {
         NIXL_ERROR << "Failed to register memory with UCCL engine";
         return NIXL_ERR_BACKEND;
     }
@@ -291,7 +289,7 @@ nixlUcclEngine::registerMem(const nixlBlobDesc &mem,
     priv->addr = (void *)mem.addr;
     priv->length = mem.len;
     priv->ref_cnt = 1;
-    priv->mr_id = reinterpret_cast<uint64_t>(mr); // Store the memory region handle
+    priv->mr_id = mr;
     out = priv;
     mem_reg_info_[mem.addr] = priv;
     NIXL_DEBUG << "Registering memory: " << mem.addr << "Device: " << mem.devId
@@ -309,11 +307,8 @@ nixlUcclEngine::deregisterMem(nixlBackendMD *meta) {
 
     // Deregister memory from UCCL engine
     if (priv->mr_id != 0) {
-        uccl_mr_t *mr = reinterpret_cast<uccl_mr_t *>(priv->mr_id);
-        if (mr) {
-            uccl_engine_mr_destroy(mr);
-            NIXL_DEBUG << "Deregistered memory: " << priv->addr << " mr_id: " << priv->mr_id;
-        }
+        uccl_engine_mr_destroy(engine_, priv->mr_id);
+        NIXL_DEBUG << "Deregistered memory: " << priv->addr << " mr_id: " << priv->mr_id;
         priv->mr_id = 0;
     }
 
@@ -458,8 +453,10 @@ nixlUcclEngine::prepXfer(const nixl_xfer_op_t &operation,
         local_priv_vector.push_back(local_priv);
     }
 
-    // Send all tx_data as a vector
-    result = uccl_engine_send_tx_md_vector(conn, md_vector.data(), md_vector.size());
+    int fifo_id;
+
+    // Send all tx_data as a vector with the FIFO ID
+    result = uccl_engine_send_tx_md_vector(conn, md_vector.data(), md_vector.size(), fifo_id);
     if (result < 0) {
         NIXL_ERROR << "Failed to send transfer metadata vector";
         return NIXL_ERR_BACKEND;
@@ -470,34 +467,28 @@ nixlUcclEngine::prepXfer(const nixl_xfer_op_t &operation,
             handle = new nixlUcclReqH(conn);
         }
         nixlUcclReqH *uccl_handle = static_cast<nixlUcclReqH *>(handle);
-
-        uccl_handle->fifo_items.clear();
-        uccl_handle->fifo_items.resize(local_priv_vector.size());
-
-        for (size_t i = 0; i < local_priv_vector.size(); i++) {
-            char fifo_item[FIFO_ITEM_SIZE];
-            int retry_count = 0;
-            const int max_retries = 50;
-            do {
-                result = uccl_engine_get_fifo_item(conn, i, &fifo_item);
-                if (result == 0) {
-                    memcpy(uccl_handle->fifo_items[i].data(), fifo_item, FIFO_ITEM_SIZE);
-                    break;
-                }
-                retry_count++;
-                if (retry_count < max_retries) {
-                    NIXL_DEBUG << "Failed to get FIFO item, retry " << retry_count << "/"
-                               << max_retries << " for item " << i;
-                    std::this_thread::sleep_for(std::chrono::microseconds(10));
-                }
-            } while (retry_count < max_retries);
-
-            if (result != 0) {
-                NIXL_ERROR << "Failed to get FIFO item after " << max_retries
-                           << " retries for item " << i;
-                return NIXL_ERR_BACKEND;
+        int retry_count = 0;
+        const int max_retries = 50;
+        do {
+            result = uccl_engine_wait_for_fifo(fifo_id);
+            if (result == 0) {
+                break;
             }
+            retry_count++;
+            if (retry_count < max_retries) {
+                NIXL_DEBUG << "Waiting for FIFO, retry " << retry_count << "/"
+                           << max_retries << " for fifo_id " << fifo_id;
+                std::this_thread::sleep_for(std::chrono::microseconds(10));
+            }
+        } while (retry_count < max_retries);
+
+        if (result != 0) {
+            NIXL_ERROR << "Failed to wait for FIFO after " << max_retries << " retries";
+            return NIXL_ERR_BACKEND;
         }
+
+        // Store the FIFO ID for use in postXfer
+        uccl_handle->fifo_id = fifo_id;
     }
 
     return NIXL_SUCCESS;
@@ -510,7 +501,6 @@ nixlUcclEngine::postXfer(const nixl_xfer_op_t &operation,
                          const std::string &remote_agent,
                          nixlBackendReqH *&handle,
                          const nixl_opt_b_args_t *opt_args) const {
-    nixlUcclReqH *uccl_handle;
     nixlUcclBackendMD *lmd;
     nixlUcclBackendMD *rmd;
     bool rcmode = false;
@@ -553,9 +543,12 @@ nixlUcclEngine::postXfer(const nixl_xfer_op_t &operation,
         }
     }
 
-    // Process each descriptor pair
-    // TODO: Use a vector send async API to send all the transfers at once
-    std::lock_guard<std::mutex> lock(mem_mutex_); // Lock once for the entire loop
+    // Collect all descriptors into vectors for batch processing using vector APIs
+    std::vector<uint64_t> mr_ids;
+    std::vector<void*> addr_v;
+    std::vector<size_t> size_v;
+    
+    std::lock_guard<std::mutex> lock(mem_mutex_); // Lock once for the entire operation
     for (size_t i = 0; i < lcnt; i++) {
         lmd = (nixlUcclBackendMD *)local[i].metadataP;
         rmd = (nixlUcclBackendMD *)remote[i].metadataP;
@@ -588,56 +581,59 @@ nixlUcclEngine::postXfer(const nixl_xfer_op_t &operation,
             return NIXL_ERR_BACKEND;
         }
 
-        uccl_mr_t *local_mr = reinterpret_cast<uccl_mr_t *>(local_priv->mr_id);
+        // Collect data for vector operation
+        mr_ids.push_back(local_priv->mr_id);  // mr_id is already uint64_t
+        addr_v.push_back((void *)local_addr);
+        size_v.push_back(lsize);
+    }
 
-        int result = 0;
-        uint64_t transfer_id = 0;
+    // Perform the vector operation (single call for all transfers)
+    int result = 0;
+    uint64_t transfer_id = 0;
+    int fifo_id = (handle) ? static_cast<nixlUcclReqH *>(handle)->fifo_id : -1;
 
-        char *fifo_item_data = nullptr;
-        if (rcmode && handle) {
-            nixlUcclReqH *uccl_handle = static_cast<nixlUcclReqH *>(handle);
-            if (i < uccl_handle->fifo_items.size()) {
-                fifo_item_data = uccl_handle->fifo_items[i].data();
-            } else {
-                NIXL_ERROR << "No FIFO item found for item: " << i
-                           << ", fifo_items.size()=" << uccl_handle->fifo_items.size();
-                return NIXL_ERR_BACKEND;
-            }
-        }
-
-        switch (operation) {
-        case NIXL_READ: {
-            result = uccl_engine_read(
-                conn, local_mr, (void *)local_addr, lsize, fifo_item_data, &transfer_id);
-            break;
-        }
-        case NIXL_WRITE:
-            if (rcmode) {
-                result = uccl_engine_write_rc(
-                    conn, local_mr, (void *)local_addr, lsize, fifo_item_data, &transfer_id);
-            } else {
-                result = uccl_engine_write(conn, local_mr, (void *)local_addr, lsize, &transfer_id);
-            }
-            break;
-        default:
-            NIXL_ERROR << "Unsupported operation type: " << operation;
+    switch (operation) {
+    case NIXL_READ: {
+        if (!rcmode) {
+            NIXL_ERROR << "NIXL_READ operations require UCCL_RCMODE=1";
             return NIXL_ERR_INVALID_PARAM;
         }
+        result = uccl_engine_read_vector(
+            conn, mr_ids, addr_v, size_v, fifo_id, lcnt, &transfer_id);
+        break;
+    }
+    case NIXL_WRITE: {
+        if (rcmode) {
+            // RC write_vector takes non-const void*
+            result = uccl_engine_write_vector_rc(
+                conn, mr_ids, addr_v, size_v, fifo_id, lcnt, &transfer_id);
+        } else {
+            // Non-RC write_vector takes const void*
+            std::vector<void const*> const_addr_v(addr_v.begin(), addr_v.end());
+            result = uccl_engine_write_vector(
+                conn, mr_ids, const_addr_v, size_v, lcnt, &transfer_id);
+        }
+        break;
+    }
+    default:
+        NIXL_ERROR << "Unsupported operation type: " << operation;
+        return NIXL_ERR_INVALID_PARAM;
+    }
 
         if (result != 0) {
             NIXL_ERROR << "UCCL operation failed with result: " << result;
             return NIXL_ERR_BACKEND;
         }
 
-        if (!handle) {
-            handle = new nixlUcclReqH(conn);
-        }
-        uccl_handle = static_cast<nixlUcclReqH *>(handle);
-        uccl_handle->pending_transfer_ids.insert(transfer_id);
-
-        NIXL_DEBUG << "Successfully posted " << (operation == NIXL_READ ? "READ" : "WRITE")
-                   << " operation: " << lsize << " bytes with transfer_id: " << transfer_id;
+    if (!handle) {
+        handle = new nixlUcclReqH(conn);
     }
+    nixlUcclReqH *uccl_handle = static_cast<nixlUcclReqH *>(handle);
+    uccl_handle->pending_transfer_ids.insert(transfer_id);
+
+    NIXL_DEBUG << "Successfully posted vector " << (operation == NIXL_READ ? "READ" : "WRITE")
+               << " operation with " << lcnt << " iovecs, transfer_id: " << transfer_id;
+    
     if (opt_args && opt_args->hasNotif) {
         uccl_handle->notif_msg = opt_args->notifMsg;
     }

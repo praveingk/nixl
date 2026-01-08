@@ -159,7 +159,7 @@ public:
     uccl_conn_t *conn;
     std::unordered_set<uint64_t> pending_transfer_ids;
     nixl_blob_t notif_msg;
-    std::vector<std::array<char, FIFO_ITEM_SIZE>> fifo_items;
+    int fifo_id = -1;
 };
 
 #endif
